@@ -1,0 +1,17 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+# Local environments and caches
+.venv*/
+.mplconfig/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Generated smoke/check outputs
+outputs_*/
+outputs/test_plot.png
+
+# Local archives
+*.zip

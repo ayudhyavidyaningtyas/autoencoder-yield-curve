@@ -1,0 +1,31 @@
+{
+  "sample_start": "1992-07-01",
+  "sample_end": "2019-07-31",
+  "maturities": [
+    "2Y",
+    "5Y",
+    "7Y",
+    "10Y",
+    "15Y",
+    "20Y"
+  ],
+  "weekly_observations": 1413,
+  "hidden_nodes": 3,
+  "epochs": 4000,
+  "learning_rate": 0.003,
+  "batch_size": 0,
+  "scale": "none",
+  "restarts": 8,
+  "seed": 42,
+  "final_training_loss": 0.010005037300288677,
+  "best_seed": 47,
+  "temporal_validation_holdout_rmse_bp": 24.719186548386446,
+  "robustness_skipped": false,
+  "trading_skipped": false,
+  "forecast_models_run": true,
+  "trading_observations": 1174,
+  "forecast_model_observations": 1174,
+  "forecast_lags": 4,
+  "lstm_units": 8,
+  "lstm_epochs": 80
+}
