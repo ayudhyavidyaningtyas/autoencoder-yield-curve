@@ -1,3 +1,3 @@
-model,mean_rmse_bp,max_rmse_bp,mean_mae_bp,max_mae_bp,period_start,period_end,observations,epochs,restarts,scale
-Autoencoder train window,19.35023547362439,22.723022783241408,14.27731330166126,16.367509578128807,1992-07-03,2014-02-21,1130,2000,4,none
-Autoencoder temporal holdout,24.719186548386446,34.46193112812394,23.222367508004236,33.09704135698085,2014-02-28,2019-08-02,283,2000,4,none
+model,mean_rmse_bp,max_rmse_bp,mean_mae_bp,max_mae_bp,period_start,period_end,observations,epochs,restarts,scale,use_bias,encoder_activation,pca_init
+Autoencoder train window,3.1902544688982535,4.313414291457031,2.3612657942277866,3.3233825644837243,1992-07-03,2014-02-21,1130,2000,4,center,True,tanh,True
+Autoencoder temporal holdout,3.944376057816749,8.52640040886115,3.568212300564955,8.451549879791935,2014-02-28,2019-08-02,283,2000,4,center,True,tanh,True

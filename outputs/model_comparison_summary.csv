@@ -1,0 +1,3 @@
+model,mean_rmse_bp,max_rmse_bp,mean_mae_bp,max_mae_bp,scale,use_bias,encoder_activation,pca_init,three_factor_variance,mean_rmse_vs_pca_multiple
+PCA reconstruction,3.0056312986786886,4.141833919841036,2.3339745339642124,3.3846328781729023,centered PCA,True,linear,True,0.9993122715679458,1.0
+Autoencoder reconstruction,3.1228937305703757,4.245603117741095,2.4178497987238488,3.5221002628475215,center,True,tanh,True,,1.039014243677605

@@ -1,0 +1,3 @@
+model,mean_rmse_bp,max_rmse_bp,mean_mae_bp,max_mae_bp,period_start,period_end,observations,epochs,restarts,scale,use_bias,encoder_activation,pca_init
+Autoencoder train window,3.564615142139844,5.1642349505316085,2.759481591348088,3.948763432850313,1993-10-01,2017-12-08,1263,2000,4,center,True,tanh,True
+Autoencoder temporal holdout,6.128884841829702,8.002035566003524,5.246063266492077,6.490276406557875,2017-12-15,2023-12-29,316,2000,4,center,True,tanh,True

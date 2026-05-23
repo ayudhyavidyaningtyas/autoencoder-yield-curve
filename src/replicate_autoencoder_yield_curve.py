@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Replicate a shallow autoencoder factor model for the JGB yield curve.
-
-The paper uses TensorFlow. This coursework implementation therefore trains the
-same 6-3-6 tanh/linear architecture with Keras while keeping preprocessing,
-diagnostics, and output tables explicit.
-"""
+"""Yield-curve factor modelling with PCA, autoencoders, and trading tests."""
 
 from __future__ import annotations
 
@@ -38,10 +33,15 @@ class AutoencoderFit:
     autoencoder: Any
     encoder: Any
     w_encoder: np.ndarray
+    b_encoder: np.ndarray
     w_decoder: np.ndarray
+    b_decoder: np.ndarray
     train_mean: np.ndarray
     train_std: np.ndarray
     scale: str
+    use_bias: bool
+    encoder_activation: str
+    pca_init: bool
     batch_size: int
     loss_history: List[float]
     seed: int
@@ -53,6 +53,23 @@ def parse_args() -> argparse.Namespace:
         description="Replicate the JGB yield-curve autoencoder paper."
     )
     parser.add_argument("--csv", type=Path, default=root / "data" / "jgbcme_all.csv")
+    parser.add_argument(
+        "--csv-format",
+        choices=["mof-jgb", "generic"],
+        default="mof-jgb",
+        help="Use mof-jgb for the Ministry of Finance source file; generic expects a normal CSV with Date plus maturity columns.",
+    )
+    parser.add_argument(
+        "--date-format",
+        default=None,
+        help="Optional pandas date format string, for example %%m/%%d/%%y for supplied US data.",
+    )
+    parser.add_argument("--dataset-name", default="JGB")
+    parser.add_argument(
+        "--maturities",
+        default=",".join(MATURITIES),
+        help="Comma-separated maturity columns to use, for example 2Y,3Y,5Y,7Y,10Y,20Y.",
+    )
     parser.add_argument("--output-dir", type=Path, default=root / "outputs")
     parser.add_argument("--start-date", default="1992-07-01")
     parser.add_argument("--end-date", default="2019-07-31")
@@ -69,9 +86,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--scale",
-        choices=["none", "standardize"],
-        default="none",
-        help="Use raw yields by default to match the paper; standardize for a numerical sensitivity check.",
+        choices=["none", "center", "standardize"],
+        default="center",
+        help=(
+            "Preprocess yields before training. The default centers each "
+            "maturity for a fair comparison with centered PCA; use none for "
+            "the raw paper-equation sensitivity check."
+        ),
+    )
+    parser.add_argument(
+        "--encoder-activation",
+        choices=["tanh", "linear"],
+        default="tanh",
+        help="Hidden-layer activation. Use tanh for the main autoencoder and linear as a PCA benchmark check.",
+    )
+    parser.add_argument(
+        "--no-bias",
+        dest="use_bias",
+        action="store_false",
+        help="Disable Keras bias terms for the raw architecture sensitivity check.",
+    )
+    parser.add_argument(
+        "--random-init",
+        dest="pca_init",
+        action="store_false",
+        help="Use random Keras initialization instead of PCA-based initialization.",
+    )
+    parser.add_argument(
+        "--tanh-init-max-abs",
+        type=float,
+        default=0.5,
+        help="Maximum absolute tanh pre-activation used by the PCA initializer.",
     )
     parser.add_argument("--skip-trading", action="store_true")
     parser.add_argument("--skip-robustness", action="store_true")
@@ -80,7 +125,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--run-forecast-models",
         action="store_true",
-        help="Also run the paper-style LSTM and VAR one-month-ahead trading comparison.",
+        help="Also run the LSTM and VAR one-month-ahead trading comparison.",
     )
     parser.add_argument("--forecast-lags", type=int, default=4)
     parser.add_argument("--lstm-units", type=int, default=8)
@@ -95,26 +140,68 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_jgb_yields(
+def maturity_to_years(label: str) -> float:
+    value = float(label[:-1])
+    unit = label[-1].upper()
+    if unit == "M":
+        return value / 12.0
+    if unit == "Y":
+        return value
+    raise ValueError(f"Unsupported maturity label: {label}")
+
+
+def set_maturity_globals(maturities: Iterable[str]) -> List[str]:
+    global MATURITIES, MATURITY_YEARS
+    parsed = [maturity.strip() for maturity in maturities if maturity.strip()]
+    if len(parsed) < 3:
+        raise ValueError("At least three maturity columns are needed.")
+    required_proxy_columns = {"2Y", "10Y", "20Y"}
+    missing_proxy_columns = required_proxy_columns.difference(parsed)
+    if missing_proxy_columns:
+        missing = ", ".join(sorted(missing_proxy_columns))
+        raise ValueError(
+            "The current proxy definitions require these maturities: "
+            f"{missing}. Include them or update make_proxies()."
+        )
+    MATURITIES = parsed
+    MATURITY_YEARS = np.array([maturity_to_years(label) for label in MATURITIES], dtype=float)
+    return parsed
+
+
+def load_yields(
     csv_path: Path,
     start_date: str,
     end_date: str,
+    csv_format: str,
+    date_format: str | None,
     maturities: Iterable[str] = MATURITIES,
 ) -> pd.DataFrame:
     if not csv_path.exists():
-        raise FileNotFoundError(
-            f"Missing {csv_path}. Download jgbcme_all.csv from the MOF historical "
-            "interest-rate page and place it in data/."
-        )
+        raise FileNotFoundError(f"Missing yield-curve CSV: {csv_path}")
 
-    raw = pd.read_csv(csv_path, skiprows=1, na_values=["-", " -", ""])
-    raw["Date"] = pd.to_datetime(raw["Date"])
+    skiprows = 1 if csv_format == "mof-jgb" else 0
+    raw = pd.read_csv(csv_path, skiprows=skiprows, na_values=["-", " -", "", "NaN"])
+    raw["Date"] = pd.to_datetime(raw["Date"], format=date_format, errors="coerce")
+    raw = raw.dropna(subset=["Date"])
     for col in raw.columns:
         if col != "Date":
             raw[col] = pd.to_numeric(raw[col], errors="coerce")
 
+    missing_columns = [col for col in maturities if col not in raw.columns]
+    if missing_columns:
+        available = ", ".join([col for col in raw.columns if col != "Date"])
+        missing = ", ".join(missing_columns)
+        raise ValueError(
+            f"Missing maturity columns in {csv_path}: {missing}. "
+            f"Available maturity columns: {available}"
+        )
+
     daily = raw.set_index("Date").sort_index()
     daily = daily.loc[start_date:end_date, list(maturities)].dropna(how="any")
+    if daily.empty:
+        raise ValueError(
+            "No complete observations remain after date filtering and maturity selection."
+        )
 
     weekly = daily.resample("W-FRI").last().dropna(how="any")
     weekly.index.name = "Date"
@@ -142,7 +229,6 @@ def run_pca(yields: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, np.ndarra
         index=["PC1", "PC2", "PC3"],
     )
 
-    # Stabilize signs for readable level/slope/curvature plots.
     if loadings.loc["PC1"].mean() < 0:
         loadings.loc["PC1"] *= -1
     if loadings.loc["PC2", "20Y"] < loadings.loc["PC2", "2Y"]:
@@ -171,6 +257,10 @@ def prepare_training_data(
         return x.copy(), mean, std
 
     mean = x.mean(axis=0, keepdims=True)
+    if scale == "center":
+        std = np.ones((1, x.shape[1]), dtype=float)
+        return x - mean, mean, std
+
     std = x.std(axis=0, keepdims=True)
     std[std == 0] = 1.0
     return (x - mean) / std, mean, std
@@ -189,6 +279,47 @@ def import_keras() -> Any:
     return tf
 
 
+def initialize_autoencoder_from_pca(
+    autoencoder: Any,
+    x_scaled: np.ndarray,
+    hidden: int,
+    use_bias: bool,
+    encoder_activation: str,
+    tanh_init_max_abs: float,
+) -> None:
+    """Initialize the autoencoder near the rank-3 PCA solution."""
+    mean_scaled = x_scaled.mean(axis=0)
+    centered = x_scaled - mean_scaled
+    _, _, vt = np.linalg.svd(centered, full_matrices=False)
+    components = vt[:hidden]
+
+    if components.shape[0] < hidden:
+        padding = np.zeros((hidden - components.shape[0], x_scaled.shape[1]), dtype=float)
+        components = np.vstack([components, padding])
+
+    scores = centered @ components.T
+    factor_scale = 1.0
+    if encoder_activation == "tanh":
+        max_abs_score = float(np.max(np.abs(scores))) if scores.size else 0.0
+        if max_abs_score > 0:
+            factor_scale = min(1.0, tanh_init_max_abs / max_abs_score)
+            factor_scale = max(factor_scale, 1e-4)
+
+    encoder_kernel = (components.T * factor_scale).astype(np.float32)
+    decoder_kernel = (components / factor_scale).astype(np.float32)
+    encoder_bias = np.zeros(hidden, dtype=np.float32)
+    decoder_bias = mean_scaled.astype(np.float32)
+
+    factor_layer = autoencoder.get_layer("factors")
+    decoder_layer = autoencoder.get_layer("reconstructed_yields")
+    if use_bias:
+        factor_layer.set_weights([encoder_kernel, encoder_bias])
+        decoder_layer.set_weights([decoder_kernel, decoder_bias])
+    else:
+        factor_layer.set_weights([encoder_kernel])
+        decoder_layer.set_weights([decoder_kernel])
+
+
 def train_autoencoder_once(
     x: np.ndarray,
     hidden: int,
@@ -196,6 +327,10 @@ def train_autoencoder_once(
     learning_rate: float,
     seed: int,
     scale: str,
+    use_bias: bool,
+    encoder_activation: str,
+    pca_init: bool,
+    tanh_init_max_abs: float,
     batch_size: int,
 ) -> AutoencoderFit:
     tf = import_keras()
@@ -210,19 +345,28 @@ def train_autoencoder_once(
     inputs = tf.keras.Input(shape=(n_features,), name="yield_curve")
     factors = tf.keras.layers.Dense(
         hidden,
-        activation="tanh",
-        use_bias=False,
+        activation=encoder_activation,
+        use_bias=use_bias,
         name="factors",
     )(inputs)
     outputs = tf.keras.layers.Dense(
         n_features,
         activation="linear",
-        use_bias=False,
+        use_bias=use_bias,
         name="reconstructed_yields",
     )(factors)
 
     autoencoder = tf.keras.Model(inputs=inputs, outputs=outputs, name="yield_curve_autoencoder")
     encoder = tf.keras.Model(inputs=inputs, outputs=factors, name="yield_curve_encoder")
+    if pca_init:
+        initialize_autoencoder_from_pca(
+            autoencoder=autoencoder,
+            x_scaled=x_scaled,
+            hidden=hidden,
+            use_bias=use_bias,
+            encoder_activation=encoder_activation,
+            tanh_init_max_abs=tanh_init_max_abs,
+        )
     autoencoder.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
         loss="mse",
@@ -237,17 +381,26 @@ def train_autoencoder_once(
         verbose=0,
     )
     losses = [float(value) for value in history.history["loss"]]
-    w_encoder = autoencoder.get_layer("factors").get_weights()[0]
-    w_decoder = autoencoder.get_layer("reconstructed_yields").get_weights()[0]
+    encoder_weights = autoencoder.get_layer("factors").get_weights()
+    decoder_weights = autoencoder.get_layer("reconstructed_yields").get_weights()
+    w_encoder = encoder_weights[0]
+    b_encoder = encoder_weights[1] if use_bias else np.zeros(hidden, dtype=float)
+    w_decoder = decoder_weights[0]
+    b_decoder = decoder_weights[1] if use_bias else np.zeros(n_features, dtype=float)
 
     return AutoencoderFit(
         autoencoder=autoencoder,
         encoder=encoder,
         w_encoder=w_encoder,
+        b_encoder=b_encoder,
         w_decoder=w_decoder,
+        b_decoder=b_decoder,
         train_mean=mean.ravel(),
         train_std=std.ravel(),
         scale=scale,
+        use_bias=use_bias,
+        encoder_activation=encoder_activation,
+        pca_init=pca_init,
         batch_size=effective_batch_size,
         loss_history=losses,
         seed=seed,
@@ -262,6 +415,10 @@ def train_autoencoder(
     restarts: int,
     seed: int,
     scale: str,
+    use_bias: bool,
+    encoder_activation: str,
+    pca_init: bool,
+    tanh_init_max_abs: float,
     batch_size: int,
 ) -> AutoencoderFit:
     best: AutoencoderFit | None = None
@@ -273,6 +430,10 @@ def train_autoencoder(
             learning_rate=learning_rate,
             seed=seed + i,
             scale=scale,
+            use_bias=use_bias,
+            encoder_activation=encoder_activation,
+            pca_init=pca_init,
+            tanh_init_max_abs=tanh_init_max_abs,
             batch_size=batch_size,
         )
         if best is None or fit.loss_history[-1] < best.loss_history[-1]:
@@ -359,10 +520,37 @@ def align_hidden_factors(
     return aligned_hidden, aligned_decoder, corr
 
 
-def plot_yield_history(yields: pd.DataFrame, out: Path) -> None:
+def orthogonalize_hidden_factors(
+    hidden_aligned: pd.DataFrame,
+    decoder_aligned: pd.DataFrame,
+    proxies: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Rotate hidden factors into an orthogonal basis."""
+    values = hidden_aligned.to_numpy(dtype=float)
+    centered = values - values.mean(axis=0, keepdims=True)
+    cov = np.cov(centered, rowvar=False, ddof=0)
+    eigenvalues, eigenvectors = np.linalg.eigh(cov)
+    order = np.argsort(eigenvalues)[::-1]
+    eigenvalues = np.maximum(eigenvalues[order], 1e-12)
+    eigenvectors = eigenvectors[:, order]
+
+    transform = eigenvectors / np.sqrt(eigenvalues)
+    rotated_values = centered @ transform
+    rotated_decoder = np.linalg.pinv(transform) @ decoder_aligned.to_numpy(dtype=float)
+    return align_hidden_factors(rotated_values, proxies, rotated_decoder)
+
+
+def max_abs_off_diagonal(corr: pd.DataFrame) -> float:
+    if corr.shape[0] <= 1:
+        return 0.0
+    mask = ~np.eye(corr.shape[0], dtype=bool)
+    return float(np.abs(corr.to_numpy(dtype=float)[mask]).max())
+
+
+def plot_yield_history(yields: pd.DataFrame, out: Path, dataset_name: str) -> None:
     fig, ax = plt.subplots(figsize=(9, 4.8))
     yields.plot(ax=ax, linewidth=1.1)
-    ax.set_title("JGB Yield History: Weekly Observations")
+    ax.set_title(f"{dataset_name} Yield History: Weekly Observations")
     ax.set_ylabel("Yield (%)")
     ax.set_xlabel("")
     ax.grid(True, alpha=0.25)
@@ -466,6 +654,45 @@ def plot_autoencoder_results(
     plt.close(fig)
 
 
+def plot_orthogonalized_factor_results(
+    decoder: pd.DataFrame,
+    hidden_aligned: pd.DataFrame,
+    proxies: pd.DataFrame,
+    output_dir: Path,
+) -> None:
+    fig, ax = plt.subplots(figsize=(7.2, 4.4))
+    for label in decoder.index:
+        ax.plot(MATURITY_YEARS, decoder.loc[label], marker="o", label=label)
+    ax.axhline(0, color="black", linewidth=0.8)
+    ax.set_xticks(MATURITY_YEARS)
+    ax.set_xlabel("Maturity")
+    ax.set_ylabel("Rotated decoder weight")
+    ax.set_title("Orthogonalized Autoencoder Decoder Loadings")
+    ax.grid(True, alpha=0.25)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(output_dir / "autoencoder_orthogonalized_decoder_loadings.png", dpi=180)
+    plt.close(fig)
+
+    fig, axes = plt.subplots(3, 1, figsize=(9, 7.5), sharex=True)
+    for ax, label in zip(axes, PROXY_NAMES):
+        comparison = pd.DataFrame(
+            {
+                f"Orthogonalized: {label}": zscore(hidden_aligned[[label]])[label],
+                f"Proxy: {label}": zscore(proxies[[label]])[label],
+            }
+        )
+        comparison.plot(ax=ax, linewidth=1.0)
+        ax.set_ylabel("z-score")
+        ax.grid(True, alpha=0.25)
+        ax.legend(fontsize=8, loc="upper right")
+    axes[0].set_title("Orthogonalized Hidden Factors vs Financial Proxies")
+    axes[-1].set_xlabel("")
+    fig.tight_layout()
+    fig.savefig(output_dir / "autoencoder_orthogonalized_factor_proxies.png", dpi=180)
+    plt.close(fig)
+
+
 def reconstruction_metrics(yields: pd.DataFrame, reconstructed: pd.DataFrame) -> pd.DataFrame:
     error = reconstructed - yields
     return pd.DataFrame(
@@ -510,6 +737,10 @@ def run_temporal_validation(
         restarts=validation_restarts,
         seed=args.seed + 10_000,
         scale=args.scale,
+        use_bias=args.use_bias,
+        encoder_activation=args.encoder_activation,
+        pca_init=args.pca_init,
+        tanh_init_max_abs=args.tanh_init_max_abs,
         batch_size=args.batch_size,
     )
 
@@ -536,6 +767,9 @@ def run_temporal_validation(
                 "epochs": validation_epochs,
                 "restarts": validation_restarts,
                 "scale": args.scale,
+                "use_bias": args.use_bias,
+                "encoder_activation": args.encoder_activation,
+                "pca_init": args.pca_init,
             },
             {
                 **summarize_reconstruction_metrics(
@@ -547,6 +781,9 @@ def run_temporal_validation(
                 "epochs": validation_epochs,
                 "restarts": validation_restarts,
                 "scale": args.scale,
+                "use_bias": args.use_bias,
+                "encoder_activation": args.encoder_activation,
+                "pca_init": args.pca_init,
             },
         ]
     )
@@ -560,7 +797,7 @@ def run_robustness_checks(
     args: argparse.Namespace,
     output_dir: Path,
 ) -> pd.DataFrame:
-    rows: List[Dict[str, float | int | str]] = []
+    rows: List[Dict[str, float | int | str | bool]] = []
     rows.append(
         {
             **summarize_reconstruction_metrics(
@@ -568,6 +805,9 @@ def run_robustness_checks(
             ),
             "hidden_nodes": 3,
             "scale": "centered PCA",
+            "use_bias": True,
+            "encoder_activation": "linear",
+            "pca_init": True,
             "epochs": 0,
             "restarts": 0,
             "best_seed": "",
@@ -578,15 +818,28 @@ def run_robustness_checks(
     robustness_restarts = max(3, args.restarts // 2)
     proxies = make_proxies(yields)
 
-    for hidden in [2, 3, 4]:
+    def add_autoencoder_row(
+        label: str,
+        hidden: int,
+        scale: str,
+        use_bias: bool,
+        encoder_activation: str,
+        pca_init: bool,
+        learning_rate: float,
+        seed: int,
+    ) -> None:
         fit = train_autoencoder(
             yields.to_numpy(dtype=float),
             hidden=hidden,
             epochs=robustness_epochs,
-            learning_rate=args.learning_rate,
+            learning_rate=learning_rate,
             restarts=robustness_restarts,
-            seed=args.seed + 20_000 + hidden,
-            scale=args.scale,
+            seed=seed,
+            scale=scale,
+            use_bias=use_bias,
+            encoder_activation=encoder_activation,
+            pca_init=pca_init,
+            tanh_init_max_abs=args.tanh_init_max_abs,
             batch_size=args.batch_size,
         )
         reconstructed = pd.DataFrame(
@@ -600,61 +853,75 @@ def run_robustness_checks(
             columns=[f"Node {i + 1}" for i in range(hidden)],
         )
         corr = correlation_table(hidden_df, proxies).abs()
-        row = {
-            **summarize_reconstruction_metrics(
-                f"Autoencoder {hidden} hidden nodes", yields, reconstructed
-            ),
-            "hidden_nodes": hidden,
-            "scale": args.scale,
-            "epochs": robustness_epochs,
-            "restarts": robustness_restarts,
-            "best_seed": fit.seed,
-            "level_max_abs_corr": float(corr["Level"].max()),
-            "slope_max_abs_corr": float(corr["Slope 20Y-2Y"].max()),
-            "curvature_max_abs_corr": float(corr["Curvature 2*10Y-2Y-20Y"].max()),
-        }
-        rows.append(row)
-
-    if args.scale == "none":
-        scaled_fit = train_autoencoder(
-            yields.to_numpy(dtype=float),
-            hidden=args.hidden,
-            epochs=robustness_epochs,
-            learning_rate=0.01,
-            restarts=robustness_restarts,
-            seed=args.seed + 30_000,
-            scale="standardize",
-            batch_size=args.batch_size,
-        )
-        scaled_reconstructed = pd.DataFrame(
-            reconstruct(scaled_fit, yields.to_numpy(dtype=float)),
-            index=yields.index,
-            columns=yields.columns,
-        )
-        scaled_hidden = pd.DataFrame(
-            encode(scaled_fit, yields.to_numpy(dtype=float)),
-            index=yields.index,
-            columns=[f"Node {i + 1}" for i in range(args.hidden)],
-        )
-        scaled_corr = correlation_table(scaled_hidden, proxies).abs()
         rows.append(
             {
                 **summarize_reconstruction_metrics(
-                    "Autoencoder 3 hidden nodes, standardized sensitivity",
+                    label,
                     yields,
-                    scaled_reconstructed,
+                    reconstructed,
                 ),
-                "hidden_nodes": args.hidden,
-                "scale": "standardize",
-                "epochs": robustness_epochs,
-                "restarts": robustness_restarts,
-                "best_seed": scaled_fit.seed,
-                "level_max_abs_corr": float(scaled_corr["Level"].max()),
-                "slope_max_abs_corr": float(scaled_corr["Slope 20Y-2Y"].max()),
-                "curvature_max_abs_corr": float(
-                    scaled_corr["Curvature 2*10Y-2Y-20Y"].max()
-                ),
+                "hidden_nodes": hidden,
+            "scale": scale,
+            "use_bias": use_bias,
+            "encoder_activation": encoder_activation,
+            "pca_init": pca_init,
+            "epochs": robustness_epochs,
+            "restarts": robustness_restarts,
+            "best_seed": fit.seed,
+                "level_max_abs_corr": float(corr["Level"].max()),
+                "slope_max_abs_corr": float(corr["Slope 20Y-2Y"].max()),
+                "curvature_max_abs_corr": float(corr["Curvature 2*10Y-2Y-20Y"].max()),
             }
+        )
+
+    for hidden in [2, 3, 4]:
+        add_autoencoder_row(
+            label=f"Autoencoder {hidden} hidden nodes",
+            hidden=hidden,
+            scale=args.scale,
+            use_bias=args.use_bias,
+            encoder_activation=args.encoder_activation,
+            pca_init=args.pca_init,
+            learning_rate=args.learning_rate,
+            seed=args.seed + 20_000 + hidden,
+        )
+
+    if (args.scale, args.use_bias, args.encoder_activation) != ("none", False, "tanh"):
+        add_autoencoder_row(
+            label="Autoencoder raw no-bias tanh",
+            hidden=args.hidden,
+            scale="none",
+            use_bias=False,
+            encoder_activation="tanh",
+            pca_init=False,
+            learning_rate=args.learning_rate,
+            seed=args.seed + 30_000,
+        )
+
+    for scale_sensitivity, seed_offset in [("center", 40_000), ("standardize", 45_000)]:
+        if scale_sensitivity == args.scale:
+            continue
+        add_autoencoder_row(
+            label=f"Autoencoder {scale_sensitivity} sensitivity",
+            hidden=args.hidden,
+            scale=scale_sensitivity,
+            use_bias=args.use_bias,
+            encoder_activation=args.encoder_activation,
+            pca_init=args.pca_init,
+            learning_rate=args.learning_rate,
+            seed=args.seed + seed_offset,
+        )
+
+    if args.encoder_activation != "linear":
+        add_autoencoder_row(
+            label="Autoencoder linear bottleneck",
+            hidden=args.hidden,
+            scale=args.scale,
+            use_bias=args.use_bias,
+            encoder_activation="linear",
+            pca_init=args.pca_init,
+            learning_rate=args.learning_rate,
+            seed=args.seed + 50_000,
         )
 
     robustness = pd.DataFrame(rows)
@@ -663,7 +930,6 @@ def run_robustness_checks(
 
 
 def trend_follow_positions(yields: pd.DataFrame) -> pd.DataFrame:
-    # If yields fell last week, trend-following expects further decline and goes long.
     weekly_change = yields.diff()
     return pd.DataFrame(
         np.where(weekly_change < 0, 1.0, -1.0),
@@ -940,6 +1206,10 @@ def rolling_autoencoder_strategy(
     restarts: int,
     seed: int,
     scale: str,
+    use_bias: bool,
+    encoder_activation: str,
+    pca_init: bool,
+    tanh_init_max_abs: float,
     batch_size: int,
     hold_weeks: int,
 ) -> pd.DataFrame:
@@ -966,6 +1236,10 @@ def rolling_autoencoder_strategy(
             restarts=restarts,
             seed=seed + year,
             scale=scale,
+            use_bias=use_bias,
+            encoder_activation=encoder_activation,
+            pca_init=pca_init,
+            tanh_init_max_abs=tanh_init_max_abs,
             batch_size=batch_size,
         )
         x_invest = yields.loc[invest_dates].to_numpy(dtype=float)
@@ -999,6 +1273,10 @@ def run_trading(
         restarts=max(2, args.restarts // 2),
         seed=args.seed,
         scale=args.scale,
+        use_bias=args.use_bias,
+        encoder_activation=args.encoder_activation,
+        pca_init=args.pca_init,
+        tanh_init_max_abs=args.tanh_init_max_abs,
         batch_size=args.batch_size,
         hold_weeks=args.hold_weeks,
     )
@@ -1067,9 +1345,25 @@ def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    yields = load_jgb_yields(args.csv, args.start_date, args.end_date)
-    yields.to_csv(args.output_dir / "weekly_jgb_yields.csv")
-    plot_yield_history(yields, args.output_dir / "yield_history.png")
+    maturities = set_maturity_globals(args.maturities.split(","))
+    yields = load_yields(
+        csv_path=args.csv,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        csv_format=args.csv_format,
+        date_format=args.date_format,
+        maturities=maturities,
+    )
+    yields.to_csv(args.output_dir / "weekly_yields.csv")
+    if args.csv_format == "mof-jgb":
+        yields.to_csv(args.output_dir / "weekly_jgb_yields.csv")
+    elif args.dataset_name.lower().startswith("us"):
+        yields.to_csv(args.output_dir / "weekly_us_yields.csv")
+    plot_yield_history(
+        yields,
+        args.output_dir / "yield_history.png",
+        dataset_name=args.dataset_name,
+    )
 
     pca_table, loadings, _ = run_pca(yields)
     pca_table.to_csv(args.output_dir / "pca_explained_variance.csv", index=False)
@@ -1087,6 +1381,10 @@ def main() -> None:
         restarts=args.restarts,
         seed=args.seed,
         scale=args.scale,
+        use_bias=args.use_bias,
+        encoder_activation=args.encoder_activation,
+        pca_init=args.pca_init,
+        tanh_init_max_abs=args.tanh_init_max_abs,
         batch_size=args.batch_size,
     )
     reconstructed_values = reconstruct(fit, yields.to_numpy(dtype=float))
@@ -1098,20 +1396,90 @@ def main() -> None:
 
     proxies = make_proxies(yields)
     hidden = encode(fit, yields.to_numpy(dtype=float))
+    decoder_weights_raw_units = fit.w_decoder * fit.train_std.reshape(1, -1)
     hidden_aligned, decoder_aligned, node_corr = align_hidden_factors(
-        hidden, proxies, fit.w_decoder
+        hidden, proxies, decoder_weights_raw_units
     )
     factor_corr = correlation_table(hidden_aligned, proxies)
+    hidden_cross_corr = hidden_aligned.corr()
+    orth_hidden, orth_decoder, orth_node_corr = orthogonalize_hidden_factors(
+        hidden_aligned,
+        decoder_aligned,
+        proxies,
+    )
+    orth_factor_corr = correlation_table(orth_hidden, proxies)
+    orth_cross_corr = orth_hidden.corr()
+
     hidden_aligned.to_csv(args.output_dir / "autoencoder_hidden_factors.csv")
     decoder_aligned.to_csv(args.output_dir / "autoencoder_decoder_loadings.csv")
     node_corr.to_csv(args.output_dir / "node_proxy_correlations.csv")
     factor_corr.to_csv(args.output_dir / "factor_proxy_correlations.csv")
+    hidden_cross_corr.to_csv(args.output_dir / "autoencoder_factor_cross_correlations.csv")
+    orth_hidden.to_csv(args.output_dir / "autoencoder_orthogonalized_factors.csv")
+    orth_decoder.to_csv(args.output_dir / "autoencoder_orthogonalized_decoder_loadings.csv")
+    orth_node_corr.to_csv(args.output_dir / "orthogonalized_node_proxy_correlations.csv")
+    orth_factor_corr.to_csv(args.output_dir / "orthogonalized_factor_proxy_correlations.csv")
+    orth_cross_corr.to_csv(
+        args.output_dir / "autoencoder_orthogonalized_factor_cross_correlations.csv"
+    )
+    pd.DataFrame(
+        [
+            {
+                "factor_set": "raw_aligned_hidden",
+                "max_abs_offdiag_correlation": max_abs_off_diagonal(hidden_cross_corr),
+            },
+            {
+                "factor_set": "orthogonalized_hidden",
+                "max_abs_offdiag_correlation": max_abs_off_diagonal(orth_cross_corr),
+            },
+        ]
+    ).to_csv(args.output_dir / "autoencoder_orthogonalization_summary.csv", index=False)
+
+    model_comparison = pd.DataFrame(
+        [
+            {
+                **summarize_reconstruction_metrics(
+                    "PCA reconstruction", yields, pca_three_reconstructed
+                ),
+                "scale": "centered PCA",
+                "use_bias": True,
+                "encoder_activation": "linear",
+                "pca_init": True,
+                "three_factor_variance": float(
+                    pca_table.loc[
+                        pca_table["component"] == 3, "cumulative_variance"
+                    ].iloc[0]
+                ),
+            },
+            {
+                **summarize_reconstruction_metrics(
+                    "Autoencoder reconstruction", yields, reconstructed
+                ),
+                "scale": args.scale,
+                "use_bias": args.use_bias,
+                "encoder_activation": args.encoder_activation,
+                "pca_init": args.pca_init,
+                "three_factor_variance": "",
+            },
+        ]
+    )
+    pca_mean_rmse = float(model_comparison.loc[0, "mean_rmse_bp"])
+    model_comparison["mean_rmse_vs_pca_multiple"] = (
+        model_comparison["mean_rmse_bp"] / pca_mean_rmse
+    )
+    model_comparison.to_csv(args.output_dir / "model_comparison_summary.csv", index=False)
 
     plot_autoencoder_results(
         yields=yields,
         reconstructed=reconstructed,
         decoder=decoder_aligned,
         hidden_aligned=hidden_aligned,
+        proxies=proxies,
+        output_dir=args.output_dir,
+    )
+    plot_orthogonalized_factor_results(
+        decoder=orth_decoder,
+        hidden_aligned=orth_hidden,
         proxies=proxies,
         output_dir=args.output_dir,
     )
@@ -1148,6 +1516,9 @@ def main() -> None:
         )
 
     config = {
+        "dataset_name": args.dataset_name,
+        "csv": str(args.csv),
+        "csv_format": args.csv_format,
         "sample_start": args.start_date,
         "sample_end": args.end_date,
         "maturities": MATURITIES,
@@ -1157,6 +1528,10 @@ def main() -> None:
         "learning_rate": args.learning_rate,
         "batch_size": args.batch_size,
         "scale": args.scale,
+        "use_bias": args.use_bias,
+        "encoder_activation": args.encoder_activation,
+        "pca_init": args.pca_init,
+        "tanh_init_max_abs": args.tanh_init_max_abs,
         "restarts": args.restarts,
         "seed": args.seed,
         "final_training_loss": fit.loss_history[-1],

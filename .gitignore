@@ -10,7 +10,11 @@ __pycache__/
 .ipynb_checkpoints/
 
 # Generated smoke/check outputs
-outputs_*/
+outputs_*smoke*/
+outputs_tf_check*/
+outputs_tune*/
+outputs_jgb_smoke_dataset_args/
+outputs_lstm_var_smoke/
 outputs/test_plot.png
 
 # Local archives
